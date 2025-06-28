@@ -92,6 +92,7 @@ struct ArticleView: View {
                                     Text(section.title)
                                         .font(fontForLevel(section))
                                         .fontWeight(.semibold)
+                                        .padding(.top, 8)
                                 }
     
                                 FormattedTextView(text: section.content, fontSize: 16, lineSpacing: 6)

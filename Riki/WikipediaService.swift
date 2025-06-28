@@ -111,10 +111,10 @@ class WikipediaService {
 
             let unwantedSelectors = [
             ".infobox", ".thumb", ".toc", ".mw-editsection",
-            ".navbox", ".metadata", "table", ".mw-empty-elt",
+            ".navbox", ".metadata", "table:not(.wikitable)", ".mw-empty-elt",
             ".mw-jump-link", ".mw-parser-output > style",
             "img", ".image", ".mbox", ".ambox", ".tmbox",
-            ".vertical-navbox", ".sistersitebox", ".wikitable"
+            ".vertical-navbox", ".sistersitebox"
             ]
             for selector in unwantedSelectors {
                 try doc.select(selector).remove()
@@ -130,12 +130,12 @@ class WikipediaService {
             
             sections.append(contentsOf: try extractSectionsFromHeadings(in: content))
             
-            if sections.isEmpty {
-                let bodyText = try doc.body()?.text() ?? ""
-                if !bodyText.isEmpty {
-                    sections.append(ArticleSection(title: "", level: 0, content: bodyText))
-                }
-            }
+            // if sections.isEmpty {
+            //     let bodyText = try doc.body()?.text() ?? ""
+            //     if !bodyText.isEmpty {
+            //         sections.append(ArticleSection(title: "", level: 0, content: bodyText))
+            //     }
+            // }
         } catch {
             print("Error parsing HTML: \(error)")
             sections.append(ArticleSection(title: "Error", level: 0, content: "Could not parse article content."))
@@ -145,61 +145,210 @@ class WikipediaService {
 
     private func extractIntroduction(from content: Element) throws -> ArticleSection? {
         var introText = ""
+        // Iterate through the direct children of the main content element
         for element in try content.children() {
             let tagName = try element.tagName().lowercased()
-            if tagName.starts(with: "h") { // Stop if a heading is encountered
-                break
+            var isSectionHeading = false
+
+            // Check if the element itself is a heading (h1-h6)
+            if tagName.starts(with: "h") && tagName.count == 2 && Int(String(tagName.dropFirst())) != nil {
+                isSectionHeading = true
             }
-            if !tagName.isEmpty {
-                 let elementText = try element.text()
-                 if !elementText.isEmpty {
-                     introText += elementText + "\n\n"
+            // Check if the element is a common wrapper for a heading (e.g., <div class="mw-heading"><h2>...</h2></div>)
+            else if let hTag = try element.select("h1, h2, h3, h4, h5, h6").first() {
+                 let hTagName = try hTag.tagName().lowercased()
+                 if hTagName.starts(with: "h") && hTagName.count == 2 && Int(String(hTagName.dropFirst())) != nil {
+                    isSectionHeading = true
                  }
             }
+
+            if isSectionHeading {
+                break // Stop accumulating intro text when the first section heading is encountered
+            }
+
+            // Append the text of the current element to the introText
+            // Filter out some common non-content elements that might appear before the first heading
+            if try !element.hasClass("shortdescription") && 
+               !element.hasClass("hatnote") && 
+               !element.hasClass("mw-jump-link") && 
+               element.tagName().lowercased() != "meta" && 
+               element.tagName().lowercased() != "style" &&
+               !element.hasClass("toc") && // Table of contents
+               !element.className().contains("infobox") && // Infoboxes
+               !element.className().contains("navbox") // Navigation boxes
+            {
+                let elementText = try formatElementContent(element)
+                if !elementText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    introText += elementText + "\n"
+                }
+            }
         }
+
         let trimmedIntro = introText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmedIntro.isEmpty ? nil : ArticleSection(title: "", level: 2, content: trimmedIntro)
+        // Return an ArticleSection for the introduction with level 0 and an empty title
+        return trimmedIntro.isEmpty ? nil : ArticleSection(title: "", level: 0, content: trimmedIntro)
+    }
+
+    private func formatElementContent(_ element: Element) throws -> String {
+        let tagName = try element.tagName().lowercased()
+        
+        // Handle unordered lists
+        if tagName == "ul" {
+            var formattedList = ""
+            for listItem in try element.select("li") {
+                formattedList += "• " + (try listItem.text()) + "\n"
+            }
+            return formattedList
+        }
+        
+        // Handle ordered lists
+        if tagName == "ol" {
+            var formattedList = ""
+            let listItems = try element.select("li")
+            for (index, listItem) in listItems.enumerated() {
+                formattedList += "\(index + 1). " + (try listItem.text()) + "\n"
+            }
+            return formattedList
+        }
+        
+        // Handle tables
+        if tagName == "table" && (try element.hasClass("wikitable")) {
+            var tableData: [[String]] = []
+            
+            // Process header row
+            if let headerRow = try element.select("tr").first() {
+                var headers: [String] = []
+                for header in try headerRow.select("th") {
+                    headers.append(try header.text().trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+                if !headers.isEmpty {
+                    tableData.append(headers)
+                }
+            }
+            
+            // Process data rows
+            for row in try element.select("tr").dropFirst() {
+                var rowData: [String] = []
+                for cell in try row.select("td") {
+                    rowData.append(try cell.text().trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+                if !rowData.isEmpty {
+                    tableData.append(rowData)
+                }
+            }
+            
+            // Convert table data to string representation
+            if !tableData.isEmpty {
+                return "<table>" + tableData.map { row in row.joined(separator: "\t") }.joined(separator: "\n") + "</table>"
+            }
+        }
+        
+        // Handle paragraphs and other elements
+        return try element.text()
     }
 
     private func extractSectionsFromHeadings(in content: Element) throws -> [ArticleSection] {
-        var extractedSections: [ArticleSection] = []
-        let headings = try content.select("h1, h2, h3, h4, h5, h6")
-        
-        for i in 0..<headings.size() {
-            let heading = try headings.get(i)
-            let headingTag = try heading.tagName().lowercased()
-            guard let level = Int(headingTag.dropFirst()) else { continue } // h1 -> 1
-            let title = try heading.text()
-            
-            var sectionContent = ""
-            var nextElement = try heading.nextElementSibling()
-            
-            while let currentElement = nextElement {
-                let currentTagName = try currentElement.tagName().lowercased()
-                // Stop if another heading of the same or higher level is encountered
-                if currentTagName.starts(with: "h") {
-                    if let nextLevel = Int(currentTagName.dropFirst()), nextLevel <= level {
-                        break
+        var sections: [ArticleSection] = []
+        var currentSectionTitle: String? = nil
+        var currentSectionLevel: Int? = nil
+        var currentSectionContent = ""
+        var pastIntroPhase = false // Becomes true after the first actual section heading is processed
+
+        // Helper to finalize the current section
+        func finalizeCurrentSection() {
+            if let title = currentSectionTitle, let level = currentSectionLevel {
+                let trimmedContent = currentSectionContent.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !title.isEmpty || !trimmedContent.isEmpty { // Add section if it has a non-empty title or content
+                    sections.append(ArticleSection(title: title, level: level, content: trimmedContent))
+                }
+            }
+            currentSectionTitle = nil
+            currentSectionLevel = nil
+            currentSectionContent = ""
+        }
+
+        for element in try content.children() {
+            var isPotentialHeadingContainer = false
+            var actualHeadingTag: Element? = nil
+            var identifiedLevel = 0
+            var identifiedTitle = ""
+
+            let tagName = try element.tagName().lowercased()
+
+            // Check if the element itself is h1-h6
+            if tagName.starts(with: "h") && tagName.count == 2, let level = Int(String(tagName.dropFirst())) {
+                isPotentialHeadingContainer = true
+                actualHeadingTag = element
+                identifiedLevel = level
+                identifiedTitle = try element.text()
+            } 
+            // Check if element contains a h1-h6 (e.g. <div class="mw-heading"><h2>...</h2></div>)
+            else if let hTag = try element.select("h1, h2, h3, h4, h5, h6").first() {
+                // Ensure this hTag is a primary heading for this element, not deeply nested.
+                // A simple check: if the element's direct children include this hTag or its parent.
+                var isPrimaryHeading = false
+                if element == hTag.parent() || element == hTag { // hTag is direct child or element itself
+                    isPrimaryHeading = true
+                } else if let hTagParent = hTag.parent(), element == hTagParent.parent() && hTagParent.hasClass("mw-headline") { // Common pattern: div > span.mw-headline > hX
+                    isPrimaryHeading = true
+                }
+                // More specific check for structures like <div class="mw-heading mw-heading2"><h2>Title</h2></div>
+                if try element.hasClass("mw-heading") && hTag.parent() == element {
+                    isPrimaryHeading = true
+                }
+
+                if isPrimaryHeading {
+                    let hTagName = try hTag.tagName().lowercased()
+                    if let level = Int(String(hTagName.dropFirst())) {
+                        isPotentialHeadingContainer = true
+                        actualHeadingTag = hTag
+                        identifiedLevel = level
+                        identifiedTitle = try hTag.text()
                     }
                 }
-                
-                let elementText = try currentElement.text()
-                if !elementText.isEmpty {
-                    sectionContent += elementText + "\n\n"
-                }
-                nextElement = try currentElement.nextElementSibling()
             }
-            
-            let trimmedSectionContent = sectionContent.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmedSectionContent.isEmpty {
-                extractedSections.append(ArticleSection(
-                    title: title,
-                    level: level,
-                    content: trimmedSectionContent
-                ))
+
+            if isPotentialHeadingContainer {
+                // This is the first heading encountered by this function after intro extraction.
+                // Or, it's a subsequent heading.
+                if !pastIntroPhase {
+                    pastIntroPhase = true // We are now processing actual sections
+                }
+                
+                // Finalize the previous section before starting a new one
+                finalizeCurrentSection()
+                
+                currentSectionTitle = identifiedTitle
+                currentSectionLevel = identifiedLevel
+                // Content will be added from subsequent non-heading elements
+
+            } else {
+                // If it's not a heading, and we are past the intro phase (first heading processed)
+                // and a section is currently being built (currentSectionTitle != nil)
+                if pastIntroPhase, currentSectionTitle != nil {
+                    // Filter out some common non-content elements that might appear between sections
+                    if try !element.hasClass("shortdescription") && 
+                   !element.hasClass("hatnote") && 
+                   !element.hasClass("mw-jump-link") && 
+                   element.tagName().lowercased() != "meta" && 
+                   element.tagName().lowercased() != "style" &&
+                   !element.hasClass("toc") &&
+                   !element.className().contains("infobox") &&
+                   !element.className().contains("navbox")
+                {
+                    let elementText = try formatElementContent(element)
+                    if !elementText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        currentSectionContent += elementText + "\n"
+                    }
+                }
+                }
             }
         }
-        return extractedSections
+
+        // Finalize the last section after the loop
+        finalizeCurrentSection()
+
+        return sections
     }
 }
 
